@@ -7,7 +7,7 @@ import os
 import sys
 import traceback
 from typing import List, Any
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, HTTPError
 
 
 # Setup logging to stdout with a decent format
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # The US GraphQL endpoint
 GRAPHQL_US_URL = 'https://api.newrelic.com/graphql'
-
+GRAPHQL_EU_URL = 'https://api.eu.newrelic.com/graphql'
 
 # The default configuration file name
 DEFAULT_CONFIG_FILE = 'config.json'
@@ -225,6 +225,7 @@ def post_graphql(
     api_key: str,
     payload: dict,
     headers: dict = {},
+    region: str = 'US'
 ) -> dict:
     """Make the actual GraphQL POST call using the given payload.
 
@@ -234,6 +235,8 @@ def post_graphql(
     :type payload: dict
     :param headers: Additional headers to send, defaults to {}.
     :type headers: dict, optional
+    :param region: The region to use for the GraphQL API call, defaults to 'US'.
+    :type region: str, optional
     :raises GraphQLApiError: if the response code of the POST call is not
         a 2XX code or if the `errors` property of the parsed GraphQL
         response is present.
@@ -245,60 +248,70 @@ def post_graphql(
         logger.debug(json.dumps(payload, indent=2))
 
     request = Request(
-        GRAPHQL_US_URL,
+        GRAPHQL_EU_URL if region == 'EU' else GRAPHQL_US_URL,
         data=json.dumps(payload).encode('utf-8'),
         headers=build_graphql_headers(api_key, headers),
     )
 
-    with urlopen(
-        request,
-        timeout=30,
-    ) as response:
-        status = response.status
-        reason = response.reason
+    try:
+        with urlopen(
+            request,
+            timeout=30,
+        ) as response:
+            status = response.status
+            reason = response.reason
 
-        if status != 200:
-            logger.error(
-                f'GraphQL request failed with status: {status}, reason: {reason}',
-            )
-            raise GraphQLApiError(
-                f'GraphQL request failed with status: {status}, reason: {reason}',
-                status,
-                reason,
-            )
-
-        try:
-            text = response.read().decode('utf-8')
-        except IOError as e:
-            logger.error(f'error reading GraphQL response: {e}')
-            raise GraphQLApiError(
-                f'error reading GraphQL response: {e}',
-                status,
-                reason,
-            )
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(json.loads(text))
-
-        response_json = json.loads(text)
-        if 'errors' in response_json:
-            for error in response_json['errors']:
+            if status != 200:
                 logger.error(
-                    'GraphQL post error: %s' % error.get('message')
+                    f'GraphQL request failed with status: {status}, reason: {reason}',
+                )
+                raise GraphQLApiError(
+                    f'GraphQL request failed with status: {status}, reason: {reason}',
+                    status,
+                    reason,
                 )
 
-            errs = ','.join([
-                error.get('message') for error in response_json['errors']
-            ])
+            try:
+                text = response.read().decode('utf-8')
+            except IOError as e:
+                logger.error(f'error reading GraphQL response: {e}')
+                raise GraphQLApiError(
+                    f'error reading GraphQL response: {e}',
+                    status,
+                    reason,
+                )
 
-            raise GraphQLApiError(
-                'GraphQL post error: %s' % errs,
-                status,
-                reason,
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(json.loads(text))
+
+            response_json = json.loads(text)
+            if 'errors' in response_json:
+                for error in response_json['errors']:
+                    logger.error(
+                        'GraphQL post error: %s' % error.get('message')
+                    )
+
+                errs = ','.join([
+                    error.get('message') for error in response_json['errors']
+                ])
+
+                raise GraphQLApiError(
+                    'GraphQL post error: %s' % errs,
+                    status,
+                    reason,
+                )
 
 
-        return response_json['data']
+            return response_json['data']
+    except HTTPError as e:
+        logger.error(
+            f'HTTP error occurred with status: {e.code}, reason: {e.reason}',
+        )
+        raise GraphQLApiError(
+            f'HTTP error occurred with status: {e.code}, reason: {e.reason}',
+            e.code,
+            e.reason,
+        )
 
 
 def build_graphql_payload(
@@ -351,6 +364,7 @@ def query_graphql(
     next_cursor_path: str = None,
     mutation: bool = False,
     headers: dict = {},
+    region: str = 'US',
 ) -> List[dict]:
     """Make generic GQL queries with built-in pagination support.
 
@@ -368,6 +382,8 @@ def query_graphql(
     :type mutation: bool, optional
     :param headers: Additional headers to send, defaults to {}.
     :type headers: dict, optional
+    :param region: The region to use for the GraphQL API call, defaults to 'US'.
+    :type region: str, optional
     :raises GraphQLApiError: if the response code of the POST call is not
         a 2XX code or if the `errors` property of the parsed GraphQL
         response is present.
@@ -389,7 +405,8 @@ def query_graphql(
         gql_result = post_graphql(
             api_key,
             build_graphql_payload(query, variables, mutation),
-            headers
+            headers,
+            region,
         )
         results.append(gql_result)
 
@@ -406,13 +423,15 @@ def query_graphql(
     return results
 
 
-def get_dashboard(api_key: str, guid: str) -> dict:
+def get_dashboard(api_key: str, guid: str, region: str = 'US') -> dict:
     """Get the data for a specific dashboard.
 
     :param api_key: The User API key to use.
     :type api_key: str
     :param guid: The GUID of the dashboard to retrieve.
     :type guid: str
+    :param region: The region to use for the GraphQL API call, defaults to 'US'.
+    :type region: str, optional
     :return: The dashboard data.
     :rtype: dict
     """
@@ -481,7 +500,7 @@ def get_dashboard(api_key: str, guid: str) -> dict:
         'guid': ('EntityGuid!', guid)
     }
 
-    results = query_graphql(api_key, query, variables)
+    results = query_graphql(api_key, query, variables, region=region)
     if len(results) != 1:
         logger.warning(
             'unexpected number of results for dashboard %s: %d',
@@ -493,15 +512,22 @@ def get_dashboard(api_key: str, guid: str) -> dict:
     return results[0]
 
 
-def update_dashboard(api_key: str, guid: str, dashboard: dict) -> None:
+def update_dashboard(
+    api_key: str,
+    guid: str,
+    dashboard_entity: dict,
+    region: str = 'US',
+) -> None:
     """Update the data for a specific dashboard.
 
     :param api_key: The User API key to use.
     :type api_key: str
     :param guid: The GUID of the dashboard to update.
     :type guid: str
-    :param dashboard: The updated dashboard data.
-    :type dashboard: dict
+    :param dashboard_entity: The updated dashboard entity definition.
+    :type dashboard_entity: dict
+    :param region: The region to use for the GraphQL API call, defaults to 'US'.
+    :type region: str, optional
     :return: None
     """
 
@@ -520,7 +546,7 @@ def update_dashboard(api_key: str, guid: str, dashboard: dict) -> None:
 
     variables = {
         'guid': ('EntityGuid!', guid),
-        'dashboard': ('DashboardInput!', dashboard)
+        'dashboard': ('DashboardInput!', dashboard_entity)
     }
 
     results = query_graphql(
@@ -528,6 +554,7 @@ def update_dashboard(api_key: str, guid: str, dashboard: dict) -> None:
         query,
         variables,
         mutation=True,
+        region=region,
     )
 
     if len(results) != 1:
@@ -560,15 +587,12 @@ def update_dashboard(api_key: str, guid: str, dashboard: dict) -> None:
 
 
 def process_dashboard_entity(
-    api_key: str,
     guid: str,
     dashboard: dict,
     refresh_rate: int,
 ) -> None:
     """Process a single dashboard entity.
 
-    :param api_key: The User API key to use.
-    :type api_key: str
     :param guid: The GUID of the dashboard to process.
     :type guid: str
     :param dashboard: The dashboard entity data.
@@ -588,12 +612,12 @@ def process_dashboard_entity(
             "missing or invalid entity definition found for entity %s" % guid
         )
 
-    new_dashboard = entity.copy()
+    new_dashboard_entity = entity.copy()
 
     #
     # Get and validate the pages
     #
-    pages = new_dashboard.get('pages')
+    pages = new_dashboard_entity.get('pages')
     if not pages:
         logger.info("no pages found for dashboard entity %s", guid)
         return
@@ -610,7 +634,7 @@ def process_dashboard_entity(
     #
     # Process each page
     #
-    for page in new_dashboard['pages']:
+    for page in new_dashboard_entity['pages']:
         if not isinstance(page, dict):
             logger.error(
                 "invalid page definition found for dashboard %s",
@@ -764,20 +788,25 @@ def process_dashboard_entity(
                     'frequency': refresh_rate
                 }
 
-    update_dashboard(api_key, guid, new_dashboard)
+    return new_dashboard_entity
 
 
 def process_dashboard_update(
     api_key: str,
     guid: str,
     refresh_rate: int,
+    region: str = 'US',
 ) -> None:
     """Update a single dashboard.
 
     :param api_key: The User API key to use.
     :type api_key: str
-    :param dashboard: The dashboard guid and refresh rate
-    :type dashboard: dict
+    :param guid: The dashboard GUID.
+    :type guid: str
+    :param refresh_rate: The refresh rate in milliseconds.
+    :type refresh_rate: int
+    :param region: The region to use for GraphQL API calls, defaults to 'US'.
+    :type region: str, optional
     :return: None
     """
 
@@ -788,14 +817,21 @@ def process_dashboard_update(
     )
 
     # Get the dashboard entity
-    dashboard_entity = get_dashboard(api_key, guid)
+    dashboard_entity = get_dashboard(api_key, guid, region)
     if not dashboard_entity:
         raise DashboardNotFoundError(
             'failed to get dashboard entity for %s' % guid,
         )
 
     # Process the dashboard entity
-    process_dashboard_entity(api_key, guid, dashboard_entity, refresh_rate)
+    new_dashboard_entity = process_dashboard_entity(
+        guid,
+        dashboard_entity,
+        refresh_rate,
+    )
+
+    # Update the dashboard entity with the new dashboard entity definition
+    update_dashboard(api_key, guid, new_dashboard_entity, region)
 
     logger.info(
         'successfully processed dashboard %s with refresh rate %d',
@@ -804,13 +840,19 @@ def process_dashboard_update(
     )
 
 
-def process_dashboard_updates(api_key: str, config: dict) -> None:
+def process_dashboard_updates(
+    api_key: str,
+    config: dict,
+    region: str = 'US',
+) -> None:
     """Update all dashboards in the given config.
 
     :param api_key: The User API key to use.
     :type api_key: str
     :param config: The configuration.
     :type config: dict
+    :param region: The region to use for GraphQL API calls, defaults to 'US'.
+    :type region: str, optional
     :return: None
     """
 
@@ -837,7 +879,7 @@ def process_dashboard_updates(api_key: str, config: dict) -> None:
             continue
 
         try:
-            process_dashboard_update(api_key, guid, refresh_rate)
+            process_dashboard_update(api_key, guid, refresh_rate, region)
             results[guid] = 'OK'
         except DashboardNotFoundError as e:
             logger.error(
@@ -890,8 +932,11 @@ def main():
             logger.error('no API key found!')
             sys.exit(1)
 
+        # Get region from config or environment variable
+        region = config.get('region') or os.getenv('NEW_RELIC_REGION') or 'US'
+
         # Process dashboards
-        process_dashboard_updates(api_key, config)
+        process_dashboard_updates(api_key, config, region)
 
     except Exception as e:
         logger.error(f'error occurred: {e}')

@@ -1,5 +1,6 @@
 {
-    "api_key": "YOUR_API_KEY",
+    "api_key": "YOUR_USER_API_KEY",
+    "region": "US_OR_EU",
     "dashboards": [
         {
             "guid": "DASHBOARD_GUID_1",
