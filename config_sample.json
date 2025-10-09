@@ -1,0 +1,13 @@
+{
+    "api_key": "YOUR_API_KEY",
+    "dashboards": [
+        {
+            "guid": "DASHBOARD_GUID_1",
+            "refreshRate": 5000
+        },
+        {
+            "guid": "DASHBOARD_GUID_2",
+            "refreshRate": 10000
+        }
+    ]
+}
