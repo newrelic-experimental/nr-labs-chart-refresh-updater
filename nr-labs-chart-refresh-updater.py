@@ -1,18 +1,18 @@
-# Built-in imports
-from email import errors
+# Standard library imports
+import datetime
 import logging
 import json
 import optparse
 import os
 import sys
 import traceback
-from typing import List, Any
+from typing import Callable, List, Any
 from urllib.request import Request, urlopen, HTTPError
 
 
 # Setup logging to stdout with a decent format
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s: %(message)s',
     stream=sys.stdout,
     level=logging.INFO
 )
@@ -22,12 +22,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# The US GraphQL endpoint
+# The GraphQL endpoints
 GRAPHQL_US_URL = 'https://api.newrelic.com/graphql'
 GRAPHQL_EU_URL = 'https://api.eu.newrelic.com/graphql'
 
+
 # The default configuration file name
+# NOTE: We use JSON instead of YML because YML support is not part of the
+# Python standard library and we want this script to be dependency-free.
 DEFAULT_CONFIG_FILE = 'config.json'
+
+
+# The backup file name datetime format
+BACKUP_FILE_NAME_DATETIME_FORMAT = '%Y%m%d_%H%M%S'
 
 
 # -----------------------------------------------------------------------------
@@ -37,13 +44,6 @@ DEFAULT_CONFIG_FILE = 'config.json'
 
 class GraphQLApiError(Exception):
     """Exception raised for GraphQL errors.
-
-    :param message: A message describing the error that occurred.
-    :type message: str
-    :param status: The status code returned by the API.
-    :type status: int
-    :param reason: The reason returned by the API.
-    :type reason: str
     """
 
     def __init__(
@@ -53,6 +53,13 @@ class GraphQLApiError(Exception):
         reason: str
     ):
         """The constructor method.
+
+        :param message: A message describing the error that occurred.
+        :type message: str
+        :param status: The HTTP status code returned on the API call.
+        :type status: int
+        :param reason: The HTTP reason returned on the API call.
+        :type reason: str
         """
 
         super().__init__(message)
@@ -62,9 +69,6 @@ class GraphQLApiError(Exception):
 
 class DashboardNotFoundError(Exception):
     """Exception raised for dashboard not found errors.
-
-    :param message: A message describing the error that occurred.
-    :type message: str
     """
 
     def __init__(
@@ -72,6 +76,9 @@ class DashboardNotFoundError(Exception):
         message: str,
     ):
         """The constructor method.
+
+        :param message: A message describing the error that occurred.
+        :type message: str
         """
 
         super().__init__(message)
@@ -79,9 +86,6 @@ class DashboardNotFoundError(Exception):
 
 class DashboardValidationError(Exception):
     """Exception raised for dashboard validation errors.
-
-    :param message: A message describing the error that occurred.
-    :type message: str
     """
 
     def __init__(
@@ -89,6 +93,9 @@ class DashboardValidationError(Exception):
         message: str,
     ):
         """The constructor method.
+
+        :param message: A message describing the error that occurred.
+        :type message: str
         """
 
         super().__init__(message)
@@ -138,6 +145,53 @@ def get_nested(d: dict, path: str) -> Any:
     return _get_nested_helper(d, path.split('.'))
 
 
+def get_backup_name(guid: str) -> str:
+    """Generate a backup file name for the given dashboard GUID.
+
+    :returns: A backup file name for the given dashboard GUID.
+    :rtype: str
+    """
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    now_str = now.strftime(BACKUP_FILE_NAME_DATETIME_FORMAT)
+
+    return f"dashboard_{guid}_{now_str}.json"
+
+
+# -----------------------------------------------------------------------------
+# I/O functions
+# -----------------------------------------------------------------------------
+
+
+def backup_dashboard(
+    backup_dir: str,
+    guid: str,
+    dashboard: dict,
+) -> None:
+    """Create a backup copy of the given dashboard definition.
+
+    :param backup_dir: The directory to save the backup file in.
+    :type backup_dir: str
+    :param guid: The GUID of the dashboard to back up.
+    :type guid: str
+    :param dashboard: The dashboard definition to back up.
+    :type dashboard: dict
+    :returns: None
+    :rtype: None
+    """
+
+    os.makedirs(backup_dir, exist_ok=True)
+
+    backup_path = os.path.join(backup_dir, get_backup_name(guid))
+
+    with open(backup_path, 'w') as backup_file:
+        logger.debug(f'Creating backup for dashboard {guid} at {backup_path}')
+        json.dump(dashboard, backup_file, indent=2)
+        logger.debug(
+            f'Backup for dashboard {guid} created successfully at {backup_path}',
+        )
+
+
 # -----------------------------------------------------------------------------
 # Config functions
 # -----------------------------------------------------------------------------
@@ -162,6 +216,18 @@ def parse_args() -> optparse.Values:
     )
 
     parser.add_option(
+        '--backup-dir',
+        default=None,
+        help='directory to save backup files',
+    )
+
+    parser.add_option(
+        '--no-backup',
+        action='store_true',
+        help='disable backup creation',
+    )
+
+    parser.add_option(
         '-d',
         '--debug',
         action='store_true',
@@ -181,7 +247,7 @@ def load_config(config_path: str) -> dict:
     :type config_path: str
     :raises FileNotFoundError: If the configuration file does not exist.
     :raises json.JSONDecodeError: If the configuration file is not valid JSON.
-    :return: The loaded configuration as a dictionary.
+    :returns: The loaded configuration as a dictionary.
     :rtype: dict
     """
 
@@ -207,7 +273,7 @@ def build_graphql_headers(api_key: str, headers: dict = {}) -> dict:
     :type api_key: str
     :param headers: Additional headers to send, defaults to {}.
     :type headers: dict, optional
-    :return: A dictionary containing HTTP headers for a Nerdgraph call.
+    :returns: A dictionary containing HTTP headers for a Nerdgraph call.
     :rtype: dict
     """
 
@@ -238,9 +304,9 @@ def post_graphql(
     :param region: The region to use for the GraphQL API call, defaults to 'US'.
     :type region: str, optional
     :raises GraphQLApiError: if the response code of the POST call is not
-        a 2XX code or if the `errors` property of the parsed GraphQL
-        response is present.
-    :return: The `data` property of the parsed GraphQL response as a dict.
+        a 2XX code or if an HTTPError is raised or if the `errors` property of
+        the parsed GraphQL response is present.
+    :returns: The `data` property of the parsed GraphQL response as a dict.
     :rtype: dict
     """
 
@@ -273,7 +339,7 @@ def post_graphql(
 
             try:
                 text = response.read().decode('utf-8')
-            except IOError as e:
+            except OSError as e:
                 logger.error(f'error reading GraphQL response: {e}')
                 raise GraphQLApiError(
                     f'error reading GraphQL response: {e}',
@@ -300,7 +366,6 @@ def post_graphql(
                     status,
                     reason,
                 )
-
 
             return response_json['data']
     except HTTPError as e:
@@ -330,7 +395,7 @@ def build_graphql_payload(
     :type variables: dict
     :param mutation: True if this is a mutation, defaults to False.
     :type mutation: bool, optional
-    :return: The GraphQL payload to send, as a dict.
+    :returns: The GraphQL payload to send, as a dict.
     :rtype: dict
     """
 
@@ -384,13 +449,11 @@ def query_graphql(
     :type headers: dict, optional
     :param region: The region to use for the GraphQL API call, defaults to 'US'.
     :type region: str, optional
-    :raises GraphQLApiError: if the response code of the POST call is not
-        a 2XX code or if the `errors` property of the parsed GraphQL
-        response is present.
-    :raises ApiError: when a next_cursor_path value is specified that is
-        invalid.
-    :return: A list of result objects, one for each page, will contain a
-        single result for unpaged queries.
+    :raises GraphQLApiError: if the response code of the GraphQL API call is not
+        a 2XX code or if an HTTPError is raised or if the `errors` property of
+        the parsed GraphQL response is present.
+    :returns: A list of result objects, one for each page. Contains a single
+        result for unpaged queries.
     :rtype: list[dict]
     """
 
@@ -424,15 +487,19 @@ def query_graphql(
 
 
 def get_dashboard(api_key: str, guid: str, region: str = 'US') -> dict:
-    """Get the data for a specific dashboard.
+    """Get the dashboard definition for the specified dashboard entity.
 
     :param api_key: The User API key to use.
     :type api_key: str
-    :param guid: The GUID of the dashboard to retrieve.
+    :param guid: The GUID of the dashboard entity to retrieve.
     :type guid: str
     :param region: The region to use for the GraphQL API call, defaults to 'US'.
     :type region: str, optional
-    :return: The dashboard data.
+    :raises GraphQLApiError: if the response code of the GraphQL API call is not
+        a 2XX code or if an HTTPError is raised or if the `errors` property of
+        the parsed GraphQL response is present or if more or less than one
+        result is found or if the dashboard definition is not valid.
+    :returns: The dashboard definition for the specified dashboard entity.
     :rtype: dict
     """
 
@@ -502,33 +569,54 @@ def get_dashboard(api_key: str, guid: str, region: str = 'US') -> dict:
 
     results = query_graphql(api_key, query, variables, region=region)
     if len(results) != 1:
-        logger.warning(
-            'unexpected number of results for dashboard %s: %d',
+        logger.error(
+            'unexpected number of results for dashboard entity %s: %d',
             guid,
             len(results),
         )
-        return
+        raise GraphQLApiError(
+            'unexpected number of results for dashboard entity %s: %d' % \
+                (guid, len(results))
+        )
 
-    return results[0]
+    # Get the dashboard definition
+    dashboard = get_nested(results[0], 'actor.entity')
+    if not isinstance(dashboard, dict):
+        logger.error(
+            'missing or invalid dashboard definition found for dashboard entity %s',
+            guid,
+        )
+        raise GraphQLApiError(
+            'missing or invalid dashboard definition found for dashboard entity %s' \
+                % guid
+        )
+
+    return dashboard
 
 
 def update_dashboard(
     api_key: str,
     guid: str,
-    dashboard_entity: dict,
+    dashboard: dict,
     region: str = 'US',
 ) -> None:
-    """Update the data for a specific dashboard.
+    """Update the definition for specified dashboard entity.
 
     :param api_key: The User API key to use.
     :type api_key: str
-    :param guid: The GUID of the dashboard to update.
+    :param guid: The GUID of the dashboard entity to update.
     :type guid: str
-    :param dashboard_entity: The updated dashboard entity definition.
-    :type dashboard_entity: dict
+    :param dashboard: The updated dashboard definition.
+    :type dashboard: dict
     :param region: The region to use for the GraphQL API call, defaults to 'US'.
     :type region: str, optional
-    :return: None
+    :raises GraphQLApiError: if the response code of the GraphQL API call is not
+        a 2XX code or if an HTTPError is raised or if the `errors` property of
+        the parsed GraphQL response is present or if more or less than one
+        result is found or if the `errors` property of the `dashboardUpdate`
+        response is present.
+    :returns: None
+    :rtype: None
     """
 
     query = """
@@ -546,7 +634,7 @@ def update_dashboard(
 
     variables = {
         'guid': ('EntityGuid!', guid),
-        'dashboard': ('DashboardInput!', dashboard_entity)
+        'dashboard': ('DashboardInput!', dashboard)
     }
 
     results = query_graphql(
@@ -559,17 +647,20 @@ def update_dashboard(
 
     if len(results) != 1:
         logger.warning(
-            'unexpected number of results for dashboard update %s: %d',
+            'unexpected number of results for update to dashboard entity %s: %d',
             guid,
             len(results),
         )
-        return
+        raise GraphQLApiError(
+            'unexpected number of results for update to dashboard entity %s: %d' \
+                % (guid, len(results))
+        )
 
     errors = get_nested(results, 'dashboardUpdate.errors')
     if errors and len(errors) > 0:
         for error in errors:
             logger.error(
-                'failed to update dashboard %s: %s',
+                'failed to update dashboard entity %s: %s',
                 guid,
                 error.get('description'),
             )
@@ -577,7 +668,7 @@ def update_dashboard(
         errs = ','.join([error.get('description') for error in errors])
 
         raise GraphQLApiError(
-            'failed to update dashboard %s: %s' % (guid, errs),
+            'failed to update dashboard entity %s: %s' % (guid, errs),
         )
 
 
@@ -586,68 +677,58 @@ def update_dashboard(
 # -----------------------------------------------------------------------------
 
 
-def process_dashboard_entity(
+def transform_widgets(
     guid: str,
     dashboard: dict,
-    refresh_rate: int,
+    transformerFn: Callable[[dict], None]
 ) -> None:
-    """Process a single dashboard entity.
+    """Visit each widget in the dashboard and apply the given transformation
+    function.
 
-    :param guid: The GUID of the dashboard to process.
+    :param guid: The GUID of the dashboard entity.
     :type guid: str
-    :param dashboard: The dashboard entity data.
+    :param dashboard: The dashboard definition.
     :type dashboard: dict
-    :param refresh_rate: The refresh rate to set for the dashboard.
-    :type refresh_rate: int
-    :return: None
+    :raises DashboardValidationError: if the page or widget definitions are
+    invalid.
+    :returns: None
+    :rtype: None
     """
-
-    entity = get_nested(dashboard, 'actor.entity')
-    if not isinstance(entity, dict):
-        logger.error(
-            "missing or invalid entity definition found for entity %s",
-            guid,
-        )
-        raise DashboardValidationError(
-            "missing or invalid entity definition found for entity %s" % guid
-        )
-
-    new_dashboard_entity = entity.copy()
 
     #
     # Get and validate the pages
     #
-    pages = new_dashboard_entity.get('pages')
+    pages = dashboard.get('pages')
     if not pages:
-        logger.info("no pages found for dashboard entity %s", guid)
+        logger.debug("no pages found for dashboard entity %s", guid)
         return
 
     if not isinstance(pages, list):
         logger.error(
-            "invalid pages found for dashboard entity %s",
+            "invalid pages element found for dashboard entity %s",
             guid,
         )
         raise DashboardValidationError(
-            "invalid pages found for dashboard entity %s" % guid
+            "invalid pages element found for dashboard entity %s" % guid
         )
 
     #
     # Process each page
     #
-    for page in new_dashboard_entity['pages']:
+    for page in dashboard['pages']:
         if not isinstance(page, dict):
             logger.error(
-                "invalid page definition found for dashboard %s",
+                "invalid page definition found for dashboard entity %s",
                 guid,
             )
             raise DashboardValidationError(
-                "invalid page definition found for dashboard %s" % guid
+                "invalid page definition found for dashboard entity %s" % guid
             )
 
         pageGuid = page.get('guid')
 
         logger.debug(
-            'processing page %s for dashboard %s',
+            'processing page %s for dashboard entity %s',
             pageGuid,
             guid,
         )
@@ -657,8 +738,8 @@ def process_dashboard_entity(
         #
         widgets = page.get('widgets')
         if not widgets:
-            logger.info(
-                "no widgets found in page %s for dashboard %s",
+            logger.debug(
+                "no widgets found in page %s for dashboard entity %s",
                 pageGuid,
                 guid,
             )
@@ -666,12 +747,13 @@ def process_dashboard_entity(
 
         if not isinstance(widgets, list):
             logger.error(
-                'invalid widgets definition found in page %s for dashboard %s',
+                'invalid widgets element found in page %s for dashboard entity %s',
                 pageGuid,
                 guid,
             )
             raise DashboardValidationError(
-                "invalid widgets definition found in page %s for dashboard %s" % (pageGuid, guid)
+                "invalid widgets element found in page %s for dashboard entity %s" \
+                    % (pageGuid, guid)
             )
 
         #
@@ -680,161 +762,277 @@ def process_dashboard_entity(
         for widget in page['widgets']:
             if not isinstance(widget, dict):
                 logger.error(
-                    'invalid widget definition found in page %s for dashboard %s',
+                    'invalid widget definition found in page %s for dashboard entity %s',
                     pageGuid,
                     guid,
                 )
                 raise DashboardValidationError(
-                    "invalid widget definition found in page %s for dashboard %s" % (pageGuid, guid)
+                    "invalid widget definition found in page %s for dashboard entity %s" \
+                        % (pageGuid, guid)
                 )
 
             widgetId = widget.get('id')
 
             logger.debug(
-                'processing widget %s for page %s for dashboard %s',
+                'transforming widget %s for page %s for dashboard entity %s',
                 widgetId,
                 pageGuid,
                 guid,
             )
 
-            #
-            # Get and validate the linked entities
-            #
-            linkedEntities = widget.get('linkedEntities')
-            if linkedEntities is None:
-                logger.info(
-                    "no linkedEntities found in widget %s for page %s for dashboard %s",
-                    widgetId,
-                    pageGuid,
-                    guid,
-                )
-            elif not isinstance(linkedEntities, list):
+            transformerFn(guid, pageGuid, widgetId, widget)
+
+
+def transform_linked_entities(
+    guid: str,
+    pageGuid: str,
+    widgetId: str,
+    widget: dict,
+) -> None:
+    """Transform the linkedEntities field to linkedEntityGuids for the specified
+    widget.
+
+    :param guid: The GUID of the dashboard entity.
+    :type guid: str
+    :param pageGuid: The GUID of the page.
+    :type pageGuid: str
+    :param widgetId: The ID of the widget.
+    :type widgetId: str
+    :param widget: The widget to transform.
+    :type widget: dict
+    :raises DashboardValidationError: if the linkedEntities definition is invalid.
+    :returns: None
+    :rtype: None
+    """
+
+    linkedEntities = widget.get('linkedEntities')
+    if linkedEntities is None:
+        logger.debug(
+            "no linkedEntities found in widget %s for page %s for dashboard entity %s",
+            widgetId,
+            pageGuid,
+            guid,
+        )
+    elif not isinstance(linkedEntities, list):
+        logger.error(
+            'invalid linkedEntities element found in widget %s for page %s for dashboard entity %s',
+            widgetId,
+            pageGuid,
+            guid,
+        )
+        raise DashboardValidationError(
+            "invalid linkedEntities element found in widget %s for page %s for dashboard entity %s" \
+                % (widgetId, pageGuid, guid)
+        )
+    else:
+        # Build the linkedEntityGuids element from the list of linkedEntities
+
+        guids = []
+
+        for entity in linkedEntities:
+            if not isinstance(entity, dict):
                 logger.error(
-                    'invalid linkedEntities found in widget %s for page %s for dashboard %s',
+                    'invalid linked entity element found in widget %s for page %s for dashboard entity %s',
                     widgetId,
                     pageGuid,
                     guid,
                 )
                 raise DashboardValidationError(
-                    "invalid linkedEntities found in widget %s for page %s for dashboard %s" % (widgetId, pageGuid, guid)
-                )
-            else:
-                #
-                # Transform the linked entities
-                #
-                guids = []
-
-                for entity in widget['linkedEntities']:
-                    if not isinstance(entity, dict):
-                        logger.error(
-                            'invalid linked entity found in widget %s for page %s for dashboard %s',
-                            widgetId,
-                            pageGuid,
-                            guid,
-                        )
-                        raise DashboardValidationError(
-                            "invalid linked entity found in widget %s for page %s for dashboard %s" % (widgetId, pageGuid, guid)
-                        )
-
-                    if 'guid' in entity:
-                        guids.append(entity['guid'])
-
-                widget['linkedEntityGuids'] = guids
-
-            #
-            # Remove the linkedEntities field if present
-            #
-            if 'linkedEntities' in widget:
-                del widget['linkedEntities']
-
-            #
-            # Get and validate the raw configuration
-            #
-            rawConfiguration = widget.get('rawConfiguration')
-            if rawConfiguration is None:
-                logger.info(
-                    "no rawConfiguration found in widget %s for page %s for dashboard %s",
-                    widgetId,
-                    pageGuid,
-                    guid,
-                )
-                rawConfiguration = {}
-            elif not isinstance(rawConfiguration, dict):
-                logger.error(
-                    'invalid rawConfiguration found in widget %s for page %s for dashboard %s',
-                    widgetId,
-                    pageGuid,
-                    guid,
-                )
-                raise DashboardValidationError(
-                    "invalid rawConfiguration found in widget %s for page %s for dashboard %s" % (widgetId, pageGuid, guid)
+                    "invalid linked entity element found in widget %s for page %s for dashboard entity %s" \
+                        % (widgetId, pageGuid, guid)
                 )
 
-            if 'refreshRate' in rawConfiguration:
-                if not isinstance(rawConfiguration['refreshRate'], dict):
-                    logger.error(
-                        'invalid refreshRate found in widget %s for page %s for dashboard %s',
-                        widgetId,
-                        pageGuid,
-                        guid,
-                    )
-                    raise DashboardValidationError(
-                        "invalid refreshRate found in widget %s for page %s for dashboard %s" % (widgetId, pageGuid, guid)
-                    )
+            if 'guid' in entity:
+                guids.append(entity['guid'])
 
-                rawConfiguration['refreshRate']['frequency'] = refresh_rate
-            else:
-                rawConfiguration['refreshRate'] = {
-                    'frequency': refresh_rate
-                }
+        widget['linkedEntityGuids'] = guids
 
-    return new_dashboard_entity
+    # Remove the original linkedEntities field if present
+    if 'linkedEntities' in widget:
+        del widget['linkedEntities']
+
+
+def fixup_linked_entities(
+    guid: str,
+    dashboard: dict,
+) -> None:
+    """Fixup any linkedEntities fields found in the widgets in the specified
+    dashboard.
+
+    :param guid: The GUID of the dashboard entity .
+    :type guid: str
+    :param dashboard: The dashboard definition.
+    :type dashboard: dict
+    :raises DashboardValidationError: if validation issues are encountered while
+    transforming the dashboard definition.
+    :returns: None
+    :rtype: None
+    """
+
+    logger.debug(f'fixing up linked entities for dashboard entity %s', guid)
+
+    transform_widgets(
+        guid,
+        dashboard,
+        transform_linked_entities,
+    )
+
+
+def update_refresh_rate(
+    guid: str,
+    pageGuid: str,
+    widgetId: str,
+    widget: dict,
+    refresh_rate: int,
+) -> None:
+    """Update the refresh rate for the specified widget.
+
+    :param guid: The GUID of the dashboard entity.
+    :type guid: str
+    :param pageGuid: The GUID of the page.
+    :type pageGuid: str
+    :param widgetId: The ID of the widget.
+    :type widgetId: str
+    :param widget: The widget to update.
+    :type widget: dict
+    :param refresh_rate: The new refresh rate.
+    :type refresh_rate: int
+    :raises DashboardValidationError: if the rawConfiguration or refreshRate
+    definitions are invalid.
+    :returns: None
+    :rtype: None
+    """
+
+    # Get and validate the raw configuration
+    rawConfiguration = widget.get('rawConfiguration')
+    if rawConfiguration is None:
+        logger.info(
+            "no rawConfiguration element found in widget %s for page %s for dashboard entity %s",
+            widgetId,
+            pageGuid,
+            guid,
+        )
+        rawConfiguration = {}
+    elif not isinstance(rawConfiguration, dict):
+        logger.error(
+            'invalid rawConfiguration element found in widget %s for page %s for dashboard entity %s',
+            widgetId,
+            pageGuid,
+            guid,
+        )
+        raise DashboardValidationError(
+            "invalid rawConfiguration element found in widget %s for page %s for dashboard entity %s" \
+                % (widgetId, pageGuid, guid)
+        )
+
+    if 'refreshRate' in rawConfiguration:
+        if not isinstance(rawConfiguration['refreshRate'], dict):
+            logger.error(
+                'invalid refreshRate element found in widget %s for page %s for dashboard entity %s',
+                widgetId,
+                pageGuid,
+                guid,
+            )
+            raise DashboardValidationError(
+                "invalid refreshRate element found in widget %s for page %s for dashboard entity %s" \
+                    % (widgetId, pageGuid, guid)
+            )
+
+        rawConfiguration['refreshRate']['frequency'] = refresh_rate
+    else:
+        rawConfiguration['refreshRate'] = { 'frequency': refresh_rate }
+
+
+def update_refresh_rates(
+    guid: str,
+    dashboard: dict,
+    refresh_rate: int,
+) -> None:
+    """Update all refresh rates for the widgets in the specified dashboard.
+
+    :param guid: The GUID of the dashboard entity.
+    :type guid: str
+    :param dashboard: The dashboard definition.
+    :type dashboard: dict
+    :param refresh_rate: The refresh rate to set for the widgets in the dashboard.
+    :type refresh_rate: int
+    :raises DashboardValidationError: if validation issues are encountered while
+    transforming the dashboard definition.
+    :returns: None
+    :rtype: None
+    """
+
+    def transformer(
+        guid: str,
+        pageGuid: str,
+        widgetId: str,
+        widget: dict,
+    ) -> None:
+        update_refresh_rate(
+            guid,
+            pageGuid,
+            widgetId,
+            widget,
+            refresh_rate
+        )
+
+    logger.debug(f'updating refresh rates for dashboard entity %s', guid)
+
+    transform_widgets(
+        guid,
+        dashboard,
+        transformer,
+    )
 
 
 def process_dashboard_update(
     api_key: str,
     guid: str,
     refresh_rate: int,
+    backup_dir: str,
     region: str = 'US',
 ) -> None:
     """Update a single dashboard.
 
     :param api_key: The User API key to use.
     :type api_key: str
-    :param guid: The dashboard GUID.
+    :param guid: The GUID of the dashboard entity.
     :type guid: str
     :param refresh_rate: The refresh rate in milliseconds.
     :type refresh_rate: int
+    :param backup_dir: The directory where the backup file should be stored. If
+    None is specified, no backup will be created.
+    :type backup_dir: str
     :param region: The region to use for GraphQL API calls, defaults to 'US'.
     :type region: str, optional
-    :return: None
+    :returns: None
+    :rtype: None
     """
 
     logger.info(
-        'processing dashboard %s with refresh rate %d',
+        'processing dashboard entity %s with refresh rate %d',
         guid,
         refresh_rate,
     )
 
-    # Get the dashboard entity
-    dashboard_entity = get_dashboard(api_key, guid, region)
-    if not dashboard_entity:
-        raise DashboardNotFoundError(
-            'failed to get dashboard entity for %s' % guid,
-        )
+    # Get the dashboard definition
+    dashboard = get_dashboard(api_key, guid, region)
 
-    # Process the dashboard entity
-    new_dashboard_entity = process_dashboard_entity(
-        guid,
-        dashboard_entity,
-        refresh_rate,
-    )
+    # Fixup the linkedEntities field in the widgets
+    fixup_linked_entities(guid, dashboard)
 
-    # Update the dashboard entity with the new dashboard entity definition
-    update_dashboard(api_key, guid, new_dashboard_entity, region)
+    # Backup the original dashboard definition before changes are made.
+    if backup_dir:
+        backup_dashboard(backup_dir, guid, dashboard)
+
+    # Update the refresh rates
+    update_refresh_rates(guid, dashboard, refresh_rate)
+
+    # Update the dashboard entity with the new dashboard definition
+    update_dashboard(api_key, guid, dashboard, region)
 
     logger.info(
-        'successfully processed dashboard %s with refresh rate %d',
+        'successfully processed dashboard entity %s with refresh rate %d',
         guid,
         refresh_rate,
     )
@@ -843,17 +1041,22 @@ def process_dashboard_update(
 def process_dashboard_updates(
     api_key: str,
     config: dict,
+    backup_dir: str,
     region: str = 'US',
 ) -> None:
     """Update all dashboards in the given config.
 
     :param api_key: The User API key to use.
     :type api_key: str
-    :param config: The configuration.
+    :param config: The user configuration.
     :type config: dict
+    :param backup_dir: The directory where backup files should be stored. If
+    None is specified, no backups will be created.
+    :type backup_dir: str
     :param region: The region to use for GraphQL API calls, defaults to 'US'.
     :type region: str, optional
-    :return: None
+    :returns: None
+    :rtype: None
     """
 
     if not 'dashboards' in config:
@@ -879,23 +1082,29 @@ def process_dashboard_updates(
             continue
 
         try:
-            process_dashboard_update(api_key, guid, refresh_rate, region)
+            process_dashboard_update(
+                api_key,
+                guid,
+                refresh_rate,
+                backup_dir,
+                region,
+            )
             results[guid] = 'OK'
         except DashboardNotFoundError as e:
             logger.error(
-                f'not found error occurred while processing dashboard %s: {e}',
+                f'not found error occurred while processing dashboard entity %s: {e}',
                 guid
             )
             results[guid] = 'NOT FOUND'
         except DashboardValidationError as e:
             logger.error(
-                f'validation error occurred while processing dashboard %s: {e}',
+                f'validation error occurred while processing dashboard entity %s: {e}',
                 guid
             )
             results[guid] = 'INVALID'
         except GraphQLApiError as e:
             logger.error(
-                f'GraphQL API error occurred while processing dashboard %s: {e}',
+                f'GraphQL API error occurred while processing dashboard entity %s: {e}',
                 guid
             )
             results[guid] = 'API ERROR'
@@ -908,9 +1117,12 @@ def process_dashboard_updates(
 # Main entry point
 # -----------------------------------------------------------------------------
 
-def main():
+
+def main() -> None:
     '''Main entry point for the script.
-    :return: None
+
+    :returns: None
+    :rtype: None
     '''
 
     logger.info(f'starting with program arguments {sys.argv[1:]}')
@@ -919,7 +1131,7 @@ def main():
         # Parse command line arguments
         options = parse_args()
 
-        # Check for debug logging
+        # Maybe enable debug logging
         if options.debug:
             logger.setLevel(logging.DEBUG)
 
@@ -927,24 +1139,36 @@ def main():
         config = load_config(options.config_file)
 
         # Get API key from config or environment variable
-        api_key = config.get('api_key') or os.getenv('NEW_RELIC_API_KEY')
+        api_key = config.get('apiKey') or os.getenv('NEW_RELIC_API_KEY')
         if not api_key:
             logger.error('no API key found!')
             sys.exit(1)
 
-        # Get region from config or environment variable
+        # Get region from config or environment variable, otherwise default to
+        # US
         region = config.get('region') or os.getenv('NEW_RELIC_REGION') or 'US'
 
+        # Resolve the backup directory
+        backup_dir = None
+
+        if not options.no_backup:
+            # Get the backup directory from the command line options or config,
+            # otherwise use the current working directory
+            backup_dir = options.backup_dir or \
+                config.get('backupDir') or \
+                os.getcwd()
+
         # Process dashboards
-        process_dashboard_updates(api_key, config, region)
+        process_dashboard_updates(api_key, config, backup_dir, region)
 
     except Exception as e:
-        logger.error(f'error occurred: {e}')
+        logger.error(f'unexpected error occurred: {e}')
         traceback.print_exception(e)
         sys.exit(1)
 
     finally:
         logger.info('finished')
+
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,7 @@
 {
-    "api_key": "YOUR_USER_API_KEY",
+    "apiKey": "YOUR_USER_API_KEY",
     "region": "US_OR_EU",
+    "backupDir": "PATH_TO_BACKUP_DIRECTORY",
     "dashboards": [
         {
             "guid": "DASHBOARD_GUID_1",
