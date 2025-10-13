@@ -68,7 +68,7 @@ section of this document prior to getting started.
 * [Installation](#installation)
 * [Configuration](#configuration)
 * [Using the CLI](#using-the-cli)
-* [Backup Files](#backup_files)
+* [Backup Files](#backup-files)
 
 ### Installation
 
