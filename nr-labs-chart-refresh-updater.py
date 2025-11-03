@@ -1077,7 +1077,8 @@ def process_dashboard_updates(
         guid = dashboard_config.get('guid')
         refresh_rate = dashboard_config.get('refreshRate')
 
-        if not guid or not refresh_rate:
+        if guid is None or refresh_rate is None or \
+            not isinstance(guid, str) or not isinstance(refresh_rate, int):
             logger.warning('invalid dashboard config: %s', dashboard_config)
             continue
 
